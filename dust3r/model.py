@@ -53,7 +53,7 @@ class InputPadder:
 def load_model(model_path, device, verbose=True):
     if verbose:
         print('... loading model from', model_path)
-    ckpt = torch.load(model_path, map_location='cpu')
+    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
     args = ckpt['args'].model.replace("ManyAR_PatchEmbed", "PatchEmbedDust3R")
     if 'landscape_only' not in args:
         args = args[:-1] + ', landscape_only=False)'
@@ -240,11 +240,12 @@ class AsymmetricCroCo3DStereo (
         return res1, res2
 
 class SpatialTempralMemory():
-    def __init__(self, norm_q, norm_k, norm_v, mem_dropout=None, 
-                 long_term_spat_size=20000, short_term_temp_size=4, 
-                 attn_thresh=1e-3, sim_thresh=0.92, 
+    def __init__(self, norm_q, norm_k, norm_v, sf_model=None, device=None, mem_dropout=None,
+                 long_term_spat_size=20000, short_term_temp_size=4,
+                 attn_thresh=1e-3, sim_thresh=0.92,
                  save_attn=False, num_patches=None):
-        self.norm_q = norm_q #0.95
+
+        self.norm_q = norm_q
         self.norm_k = norm_k
         self.norm_v = norm_v
         self.mem_dropout = mem_dropout
@@ -256,13 +257,17 @@ class SpatialTempralMemory():
         self.sim_thresh = sim_thresh
         self.num_patches = num_patches
         self.interval = None
-        self.sf_model = torch.nn.DataParallel(RAFT(create_raft_args()))
-        self.sf_model.load_state_dict(torch.load('./checkpoints/raft-things.pth'))
-        self.sf_model = self.sf_model.module
-        self.sf_model.requires_grad_(False)
+
+        self.device = device
+        self.sf_model = sf_model  # <-- externally provided (already loaded & on device)
+
         self.init_mem()
     
     def init_mem(self):
+        # ---- RAFT profiler accumulators ----
+        self._raft_prof_ms = 0.0
+        self._raft_prof_calls = 0
+
         self.temporal_buffer = []
         self.spatial_buffer = []
         self.mem_k = None
@@ -442,15 +447,41 @@ class SpatialTempralMemory():
 
                 
     def uncertainty_map(self, view1, view2, pointmap1, pointmap2):
-        image1 = view1['origin_img'].permute(0, 3, 1, 2).cuda()
-        image2 = view2['origin_img'].permute(0, 3, 1, 2).cuda()
-        
+        if self.sf_model is None:
+            raise RuntimeError("sf_model (RAFT) is None. Provide RAFT model or set uncertainty_check=False.")
+
+        dev = self.device
+        if dev is None:
+            dev = pointmap1.device  # fallback
+
+        image1 = view1['origin_img'].permute(0, 3, 1, 2).to(dev, non_blocking=True)
+        image2 = view2['origin_img'].permute(0, 3, 1, 2).to(dev, non_blocking=True)
+
         padder = InputPadder(image1.shape)
         image1, image2 = padder.pad(image1, image2)
-        flow_low, flow_up_fw = self.sf_model(image2, image1, iters=20, test_mode=True)
+
+        import time
+        def _cuda_sync():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        raft_iters = int(os.environ.get("RAFT_ITERS", "20"))
+
+        _cuda_sync(); t0 = time.perf_counter()
+        flow_low, flow_up_fw = self.sf_model(image2, image1, iters=raft_iters, test_mode=True)
+        _cuda_sync(); t1 = time.perf_counter()
+
+        ms = (t1 - t0) * 1000.0
+        self._raft_prof_ms += ms
+        self._raft_prof_calls += 1
+        if os.environ.get("RAFT_VERBOSE", "0") == "1":
+            print(f"[PROFILE-RAFT] iters={raft_iters} time: {ms:.2f} ms shape={tuple(image1.shape)}")
+
         flow_pr = padder.unpad(flow_up_fw).permute(0, 2, 3, 1)
         uncertainty_map = detect_dynamic_regions_3d_distance(pointmap2, pointmap1, flow_pr)
         return uncertainty_map
+
+
     
 
     def memory_read(self, feat, res=True):
@@ -564,6 +595,36 @@ class Endo3R(nn.Module):
         # Memory encoder
         self.set_memory_encoder(enc_embed_dim=768 if use_feat else 1024, memory_dropout=memory_dropout) 
         self.set_attn_head()
+        # ---- RAFT: load once (for uncertainty check) ----
+        raft_args = create_raft_args()
+        self.sf_model = RAFT(raft_args)
+        # ---- RAFT: load once for uncertainty check ----
+        raft_args = create_raft_args()
+        self.sf_model = RAFT(raft_args)
+
+        raft_obj = torch.load('./checkpoints/raft-things.pth', map_location='cpu')
+
+        if isinstance(raft_obj, dict) and 'state_dict' in raft_obj:
+            raft_sd = raft_obj['state_dict']
+        elif isinstance(raft_obj, dict) and 'model' in raft_obj:
+            raft_sd = raft_obj['model']
+        else:
+            raft_sd = raft_obj  # assume it is already a state_dict
+
+        new_sd = {}
+        for k, v in raft_sd.items():
+            if k.startswith('module.'):
+                k = k[len('module.'):]
+            new_sd[k] = v
+
+        missing, unexpected = self.sf_model.load_state_dict(new_sd, strict=False)
+        print(f"[RAFT] missing={len(missing)} unexpected={len(unexpected)}")
+        if len(missing) < 20 and len(unexpected) < 20:
+            print("[RAFT] missing keys:", missing)
+            print("[RAFT] unexpected keys:", unexpected)
+
+        self.sf_model.requires_grad_(False)
+        self.sf_model.eval()
         
 
     def set_memory_encoder(self, enc_depth=6, enc_embed_dim=1024, out_dim=1024, enc_num_heads=16, 
@@ -733,11 +794,20 @@ class Endo3R(nn.Module):
         return best_id, best_dec1, best_dec2, best_res1, best_res2, best_feat2, best_pos2, best_shape2, best_conf
     
     def forward(self, frames, return_memory=False, eval=False, uncertainty_check=True):
+        dev = frames[0]['img'].device if len(frames) > 0 else None
+
         if self.training:
-            sp_mem = SpatialTempralMemory(self.norm_q, self.norm_k, self.norm_v, mem_dropout=self.mem_dropout, attn_thresh=0)
+            sp_mem = SpatialTempralMemory(
+                self.norm_q, self.norm_k, self.norm_v,
+                sf_model=self.sf_model, device=dev,
+                mem_dropout=self.mem_dropout, attn_thresh=0
+            )
         else:
-            sp_mem = SpatialTempralMemory(self.norm_q, self.norm_k, self.norm_v)
-        
+            sp_mem = SpatialTempralMemory(
+                self.norm_q, self.norm_k, self.norm_v,
+                sf_model=self.sf_model, device=dev
+            )
+
         feat1, feat2, pos1, pos2, shape1, shape2 = None, None, None, None, None, None
         feat_k1, feat_k2 = None, None
 
@@ -820,6 +890,10 @@ class Endo3R(nn.Module):
         if return_memory:
             return preds, preds_all, sp_mem
         
+        if hasattr(sp_mem, "_raft_prof_calls") and sp_mem._raft_prof_calls > 0:
+            print(f"[PROFILE-RAFT-SUM] calls={sp_mem._raft_prof_calls} total={sp_mem._raft_prof_ms:.2f} ms "
+                  f"avg={sp_mem._raft_prof_ms/sp_mem._raft_prof_calls:.2f} ms")
+       
         return preds, preds_all
     
     def pred_intrinsic(self, pred):

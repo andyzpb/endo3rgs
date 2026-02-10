@@ -10,8 +10,20 @@ from dust3r.cloud_opt.pair_viewer import PairViewer
 from dust3r.utils.geometry import xy_grid, geotrf, depthmap_to_pts3d
 from dust3r.utils.device import to_cpu, to_numpy
 from dust3r.utils.goem_opt import DepthBasedWarping, OccMask, WarpImage, depth_regularization_si_weighted, tum_to_pose_matrix
-from third_party.raft import load_RAFT
-from sam2.build_sam import build_sam2_video_predictor
+try:
+    from dust3r.RAFT.raft import load_RAFT
+except ImportError:
+    try:
+        from third_party.raft import load_RAFT
+    except ImportError:
+        print("Warning: RAFT not found.")
+        load_RAFT = None
+
+try:
+    from sam2.build_sam import build_sam2_video_predictor
+except ImportError:
+    print("Warning: SAM2 not found. disabling sam2_mask_refine.")
+    build_sam2_video_predictor = None
 sam2_checkpoint = "third_party/sam2/checkpoints/sam2.1_hiera_large.pt"
 model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
