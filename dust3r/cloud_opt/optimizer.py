@@ -14,13 +14,13 @@ try:
     from dust3r.RAFT.raft import load_RAFT
 except ImportError:
     try:
-        from third_party.raft import load_RAFT
+        from third_party.raft.core import raft as load_RAFT
     except ImportError:
         print("Warning: RAFT not found.")
         load_RAFT = None
 
 try:
-    from sam2.build_sam import build_sam2_video_predictor
+    from third_party.sam2.sam2.build_sam import build_sam2_video_predictor
 except ImportError:
     print("Warning: SAM2 not found. disabling sam2_mask_refine.")
     build_sam2_video_predictor = None

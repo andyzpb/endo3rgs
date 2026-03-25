@@ -307,7 +307,7 @@ def main(args):
             pts.reshape(-1, 3).astype(np.float32), 
             points_2d.reshape(-1, 2).astype(np.float32), 
             intrinsic.astype(np.float32),
-            dist_coeffs,  # <--- 使用我们上面定义的标定畸变系数
+            dist_coeffs,  # <--- Use the distortion coefficients defined above
             iterationsCount=100, reprojectionError=2)
 
         if not success:

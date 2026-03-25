@@ -2,76 +2,115 @@ import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
-def render(viewpoint_camera, pc, bg_color):
+def render(viewpoint_camera, pc, bg_color, scaling_modifier=1.0, depth_downsample_factor=2):
     """
-    viewpoint_camera: data_loader.Camera 对象
-    pc: gaussian_model.GaussianModel 对象
+    Render the scene. 
+    depth_downsample_factor: Downsampling factor when rendering depth (2 means 1/2 resolution, saves VRAM)
     """
     
-    # 1. 准备屏幕空间坐标
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-    try:
-        screenspace_points.retain_grad()
-    except:
-        pass
-
-    # 2. 设置光栅化参数
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    # 1. Set rasterization parameters (RGB Pass - Full Resolution)
+    tanfovx = math.tan(viewpoint_camera.fx / viewpoint_camera.width * 2 * math.atan(0.5 * viewpoint_camera.width / viewpoint_camera.fx))
+    tanfovy = math.tan(viewpoint_camera.fy / viewpoint_camera.height * 2 * math.atan(0.5 * viewpoint_camera.height / viewpoint_camera.fy))
 
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image.shape[1]),
-        image_width=int(viewpoint_camera.image.shape[2]),
+        image_height=int(viewpoint_camera.height),
+        image_width=int(viewpoint_camera.width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
-        scale_modifier=1.0,
-        viewmatrix=torch.transpose(torch.zeros((4,4)), 0, 1).cuda(), # 暂时占位，实际应该用 camera.world_view_transform
-        projmatrix=torch.transpose(torch.zeros((4,4)), 0, 1).cuda(), # 暂时占位
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.w2c.transpose(0, 1),
+        projmatrix=viewpoint_camera.w2c.transpose(0, 1) @ torch.tensor([
+            [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]
+        ], device="cuda").float(),
         sh_degree=3,
-        campos=viewpoint_camera.T,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=False
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz
+    means2D = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
+    try:
+        means2D.retain_grad()
+    except:
+        pass
+
+    # ===============================================
+    # Pass 1: Render RGB image (Full Res)
+    # ===============================================
+    rendered_image, radii = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=pc._features_dc,
+        colors_precomp=None, # Use SH for RGB Pass
+        opacities=pc.get_opacity,
+        scales=pc.get_scaling,
+        rotations=pc.get_rotation,
+        cov3D_precomp=None
+    )
+
+    # ===============================================
+    # Pass 2: Render depth map (Low Res - VRAM Saver)
+    # ===============================================
+    raster_settings_depth = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.height // depth_downsample_factor), # Downsample
+        image_width=int(viewpoint_camera.width // depth_downsample_factor),   # Downsample
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=torch.zeros(3, device="cuda"), 
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.w2c.transpose(0, 1),
+        projmatrix=viewpoint_camera.w2c.transpose(0, 1) @ torch.tensor([
+            [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]
+        ], device="cuda").float(),
+        sh_degree=3,
+        campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=False
     )
     
-    # *注意*：这里简化了 ViewMatrix 和 ProjMatrix 的计算。
-    # 在正式代码中，需要根据 R 和 T 构建 4x4 矩阵。
-    # 为了跑通，这里需要一个简单的 helper function 构建矩阵，我这里略过以保持简洁，
-    # 实际运行时 diff-gaussian-rasterization 需要正确的 viewmatrix (W2C) 和 projmatrix (W2C * Projection)。
-    
-    # 修正：简单构建一下矩阵
-    w2c = torch.eye(4, device="cuda")
-    w2c[:3, :3] = viewpoint_camera.R
-    w2c[:3, 3] = viewpoint_camera.T
-    # 需要转置因为 rasterizer 期望行优先或列优先的具体格式（通常是转置的）
-    viewmatrix = w2c.transpose(0, 1) 
-    
-    # 简单的投影矩阵构建 (假设无 skew)
-    zfar = 100.0
-    znear = 0.01
-    proj = torch.zeros((4, 4), device="cuda")
-    proj[0, 0] = 1.0 / tanfovx
-    proj[1, 1] = 1.0 / tanfovy
-    proj[2, 2] = zfar / (zfar - znear)
-    proj[2, 3] = -(zfar * znear) / (zfar - znear)
-    proj[3, 2] = 1.0
-    
-    full_proj = (w2c.unsqueeze(0).bmm(proj.unsqueeze(0))).squeeze(0).transpose(0, 1)
-    
-    raster_settings.viewmatrix = viewmatrix
-    raster_settings.projmatrix = full_proj
+    rasterizer_depth = GaussianRasterizer(raster_settings=raster_settings_depth)
 
-    # 3. 实例化光栅化器并渲染
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    # 1. Coordinate transformation
+    w2c = viewpoint_camera.w2c
+    R = w2c[:3, :3]
+    t = w2c[:3, 3]
+    cam_points = R @ means3D.transpose(0, 1) + t.unsqueeze(1)
+    
+    # 2. Extract depth
+    depths = cam_points[2, :].unsqueeze(1)
+    
+    # 3. Render (input to color)
+    depth_as_color = depths.repeat(1, 3)
 
-    rendered_image, radii = rasterizer(
-        means3D = pc.get_xyz,
-        means2D = screenspace_points,
-        shs = pc.get_features,
-        opacities = pc.get_opacity,
-        scales = pc.get_scaling,
-        rotations = pc.get_rotation,
-        cov3D_precomp = None
+    # [Critical Fix] 
+    # 1. Create new means2D_depth to prevent gradient conflict (previous RuntimeError was largely due to reusing means2D)
+    means2D_depth = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
+    try: means2D_depth.retain_grad()
+    except: pass
+    
+    # 2. Strictly adhere to mutual exclusivity: shs=None, colors_precomp=depth_as_color
+    rendered_depth, _ = rasterizer_depth(
+        means3D=means3D,
+        means2D=means2D_depth, # Use new means2D variable
+        shs=None,              # Must be None!
+        colors_precomp=depth_as_color, # Use depth color
+        opacities=pc.get_opacity,
+        scales=pc.get_scaling,
+        rotations=pc.get_rotation,
+        cov3D_precomp=None
     )
+    
+    # 4. Extract single channel [1, H/2, W/2]
+    rendered_depth = rendered_depth[0:1, :, :]
 
-    return {"render": rendered_image, "viewspace_points": screenspace_points}
+    return {
+        "render": rendered_image,
+        "render_depth": rendered_depth,
+        "viewspace_points": means2D,
+        "visibility_filter": radii > 0,
+        "radii": radii
+    }

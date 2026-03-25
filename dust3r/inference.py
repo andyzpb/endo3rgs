@@ -56,11 +56,11 @@ def visualize_results(view1, view2, pred1, pred2, save_dir='./tmp', save_name=No
     print(f'Saving visualization to {save_path}, in dir {save_dir}')
     return viz.save_glb(save_path)
 
-def loss_of_one_batch(batch, model, criterion, device, symmetrize_batch=False, use_amp=False, ret=None):
+def loss_of_one_batch(batch, model, criterion, device, symmetrize_batch=False, use_amp=True, ret=None):
     view1, view2 = batch
     ignore_keys = set(['depthmap', 'dataset', 'label', 'instance', 'idx', 'true_shape', 'rng'])
     for view in batch:
-        for name in view.keys():  # pseudo_focal
+        for name in view.keys():
             if name in ignore_keys:
                 continue
             view[name] = view[name].to(device, non_blocking=True)
@@ -68,38 +68,34 @@ def loss_of_one_batch(batch, model, criterion, device, symmetrize_batch=False, u
     if symmetrize_batch:
         view1, view2 = make_batch_symmetric(batch)
 
-    with torch.cuda.amp.autocast(enabled=bool(use_amp)):
+    # Inference acceleration using latest torch.amp API
+    with torch.amp.autocast('cuda', enabled=bool(use_amp)):
         pred1, pred2 = model(view1, view2)
             
-        # loss is supposed to be symmetric
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             loss = criterion(view1, view2, pred1, pred2) if criterion is not None else None
 
-    result = dict(view1=view1, view2=view2, pred1=pred1, pred2=pred2, loss=loss)
-        
-    return result[ret] if ret else result
+    return dict(view1=view1, view2=view2, pred1=pred1, pred2=pred2, loss=loss)
 
 
 @torch.no_grad()
-def inference(pairs, model, device, batch_size=8, verbose=True):
+def inference(pairs, model, device, batch_size=1, use_amp=True, verbose=True):
     if verbose:
         print(f'>> Inference with model on {len(pairs)} image pairs')
     result = []
 
-    # first, check if all images have the same size
     multiple_shapes = not (check_if_same_size(pairs))
-    if multiple_shapes:  # force bs=1
+    if multiple_shapes:
         batch_size = 1
 
-    for i in tqdm.trange(0, len(pairs), batch_size, disable=not verbose):
+    # Enable autocast outside loop to reduce overhead, use to_cpu to prevent GPU memory overflow
+    with torch.amp.autocast('cuda', enabled=bool(use_amp)):
+        for i in tqdm.trange(0, len(pairs), batch_size, disable=not verbose):
+            res = loss_of_one_batch(collate_with_cat(pairs[i:i+batch_size]), 
+                                   model, None, device, use_amp=use_amp)
+            result.append(to_cpu(res))
 
-        res = loss_of_one_batch(collate_with_cat(pairs[i:i+batch_size]), model, None, device)
-
-        result.append(to_cpu(res))
-
-    result = collate_with_cat(result, lists=multiple_shapes)
-
-    return result
+    return collate_with_cat(result, lists=multiple_shapes)
 
 
 def check_if_same_size(pairs):

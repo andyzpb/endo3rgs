@@ -463,7 +463,12 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
         print([name for name, value in net.named_parameters() if value.requires_grad])
 
     lr_base = lr
-    optimizer = torch.optim.Adam(params, lr=lr, betas=(0.9, 0.9))
+    # Use fused Adam for faster compute
+    optimizer = torch.optim.Adam(params, lr=lr, betas=(0.9, 0.9), 
+                                 fused=True if torch.cuda.is_available() else False)
+    
+    # [Fix] Use new torch.amp API, correctly pass device type 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
 
     loss = float('inf')
     if verbose:
@@ -472,24 +477,27 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
                 if bar.n % 500 == 0 and depth_map_save_dir is not None:
                     if not os.path.exists(depth_map_save_dir):
                         os.makedirs(depth_map_save_dir)
-                    # visualize the depthmaps
+                    # Depth visualization logic
                     depth_maps = net.get_depthmaps()
                     for i, depth_map in enumerate(depth_maps):
                         depth_map_save_path = os.path.join(depth_map_save_dir, f'depthmaps_{i}_iter_{bar.n}.png')
                         plt.imsave(depth_map_save_path, depth_map.detach().cpu().numpy(), cmap='jet')
                     print(f"Saved depthmaps at iteration {bar.n} to {depth_map_save_dir}")
+                
                 loss, lr = global_alignment_iter(net, bar.n, niter, lr_base, lr_min, optimizer, schedule, 
-                                                 temporal_smoothing_weight=temporal_smoothing_weight)
+                                                 temporal_smoothing_weight=temporal_smoothing_weight,
+                                                 scaler=scaler)
                 bar.set_postfix_str(f'{lr=:g} loss={loss:g}')
                 bar.update()
     else:
         for n in range(niter):
             loss, _ = global_alignment_iter(net, n, niter, lr_base, lr_min, optimizer, schedule, 
-                                            temporal_smoothing_weight=temporal_smoothing_weight)
+                                            temporal_smoothing_weight=temporal_smoothing_weight,
+                                            scaler=scaler)
     return loss
 
 
-def global_alignment_iter(net, cur_iter, niter, lr_base, lr_min, optimizer, schedule, temporal_smoothing_weight=0):
+def global_alignment_iter(net, cur_iter, niter, lr_base, lr_min, optimizer, schedule, temporal_smoothing_weight=0, scaler=None):
     t = cur_iter / niter
     if schedule == 'cosine':
         lr = cosine_schedule(t, lr_base, lr_min)
@@ -510,17 +518,28 @@ def global_alignment_iter(net, cur_iter, niter, lr_base, lr_min, optimizer, sche
     if net.empty_cache:
         torch.cuda.empty_cache()
     
-    loss = net(epoch=cur_iter)
+    # Check if mixed precision is available
+    use_amp = scaler is not None and scaler.is_enabled()
+    
+    # [Fix] Use new torch.amp.autocast interface, explicitly specify 'cuda'
+    with torch.amp.autocast('cuda', enabled=use_amp):
+        loss = net(epoch=cur_iter)
     
     if net.empty_cache:
         torch.cuda.empty_cache()
     
-    loss.backward()
-    
-    if net.empty_cache:
-        torch.cuda.empty_cache()
-    
-    optimizer.step()
+    if use_amp:
+        # [Fix] scaler.scale now correctly recognizes Float type loss
+        scaler.scale(loss).backward()
+        if net.empty_cache:
+            torch.cuda.empty_cache()
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        if net.empty_cache:
+            torch.cuda.empty_cache()
+        optimizer.step()
     
     return float(loss), lr
 

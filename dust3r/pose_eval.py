@@ -7,7 +7,7 @@ from dust3r.utils.vo_eval import load_traj, eval_metrics, plot_trajectory, save_
 import croco.utils.misc as misc
 import torch.distributed as dist
 from tqdm import tqdm
-from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+from third_party.sam2.checkpoints import global_aligner, GlobalAlignerMode
 from dust3r.utils.image import load_images, rgb, enlarge_seg_masks
 from dust3r.image_pairs import make_pairs
 from dust3r.inference import inference
