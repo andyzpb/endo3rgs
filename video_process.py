@@ -111,11 +111,11 @@ if __name__ == "__main__":
     CROP_BOTTOM = add             # 78
 
     # ===== Update video path here =====
-    VIDEO_PATH = "/home/andrewz/endo3rgs/WIN_20260204_10_36_27_Pro.mp4"
+    VIDEO_PATH = "/home/mrlab/Documents/andrew/Robo_Ctrl/video_data/WIN_20260204_11_02_41_Pro.mp4"
 
     extract_cropped_frames_to_jpg(
         video_path=VIDEO_PATH,
-        out_dir="video_frames_cropped_WIN_20260204_10_36_27_Pro",
+        out_dir="video_frames_cropped_WIN_20260204_11_02_41_Pro",
         crop_left=CROP_LEFT,
         crop_right=CROP_RIGHT,
         crop_top=CROP_TOP,
